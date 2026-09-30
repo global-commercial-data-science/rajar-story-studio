@@ -1,0 +1,519 @@
+# =====================================================================================
+# Offline semantic layer: HACKATHON_TEAM_GINGER_DB.ANALYTICS
+#
+# Tool-agnostic description of the AdWanted listening star schema, written for an AI
+# agent that generates plain Snowflake SQL. It needs no Snowflake objects to be read:
+# load it into the agent's context (or parse it) and generate SQL against the
+# physical tables named below.
+#
+# Profiled from live data on 2026-09-29. Row counts, distinct counts, null counts and
+# value lists are real. Expected results in verified_queries were checked against
+# published RAJAR 2026 Q2 figures.
+# =====================================================================================
+
+version: 1
+name: rajar_adwanted_listening
+description: >-
+  Respondent-level UK radio listening from the RAJAR AdWanted diary, 2026 Q2 release.
+  Each fact row is one weighted diary claim: an adult aged 15+ listened to a station code
+  on a platform, on a day of the week, in a time slot. Brands are AdWanted sales groups
+  (SGP) linked to their owner and to the matching published RAJAR report.
+source:
+  database: HACKATHON_TEAM_GINGER_DB
+  schema: ANALYTICS
+  upstream: SRC_RAJAR_SHARE.RAJAR (mirrored as HACKATHON_TEAM_GINGER_DB.RAJAR)
+  release: 2026 Q2 (RAJAR RELEASE_NUMBER 202602)
+  profiled_at: '2026-09-29'
+  build_script: sql/analytics/01_build_model.sql
+universe:
+  description: UK adults aged 15+
+  population_000s: 59047
+  respondents_15_plus: 33523
+  listeners_15_plus: 29676   # adults with at least one diary claim
+
+# -------------------------------------------------------------------------------------
+# Rules the SQL generator must follow
+# -------------------------------------------------------------------------------------
+rules:
+  - id: reach_is_distinct
+    text: >-
+      Weekly reach counts each respondent once. Compute it only with the reach metric
+      expression (SUM(DISTINCT reach_key) - SUM(DISTINCT reach_base)) / 10000, never by
+      summing weight_persons over fact rows. Reach cannot be added across platforms,
+      dayparts, days or brands; recompute it for the combined filter instead.
+  - id: brand_fact_needs_brand
+    text: >-
+      FACT_BRAND_LISTENING repeats each claim once per brand the station belongs to.
+      Always filter it to specific brand_id/brand_name values or GROUP BY brand. Never
+      total it across all brands. For all-radio, platform or station questions with no
+      brand, use FACT_LISTENING.
+  - id: owner_families
+    text: >-
+      "Global" / "Global Media" means OWNER LIKE 'GLOBAL%' (GLOBAL, GLOBAL - BRANDS,
+      GLOBAL - COMMUNICORP). "Bauer" means OWNER LIKE 'BAUER%' (BAUER, BAUER - PARTNER).
+  - id: brand_name_variants
+    text: >-
+      A brand often has trading variants, e.g. "Heart London", "Heart London Airtime
+      Trading", "Heart London Sponsorship Trading". Prefer the plain name. If the exact
+      name is unknown, search with BRAND_NAME ILIKE '%term%' and pick the shortest match.
+  - id: station_name_case
+    text: >-
+      DIM_STATION.STATION_NAME is title-cased from RAJAR upper case ("Bbc Radio 2",
+      "Capital London"). Match station names case-insensitively (ILIKE or UPPER()).
+  - id: always_show_sample
+    text: >-
+      Return the unweighted sample (COUNT(DISTINCT respondent_id)) with every reach or
+      hours figure. Flag samples below 100 as low base.
+  - id: units
+    text: >-
+      Reach is in thousands of people (000s). Hours are weekly hours; the hours metric
+      divides by 1000 to return thousands of hours (000s). Market share is a percent.
+  - id: published_comparison
+    text: >-
+      DIM_BRAND.PUBLISHED_* figures are directly comparable with this model only when
+      PUBLISHED_SURVEY_PERIOD = 'Q' (all 53 such brands match exactly). 'H' (6-month) and
+      'Y' (12-month) figures use longer fieldwork and will differ; say so when comparing.
+  - id: bridge_left_join
+    text: >-
+      BRIDGE_BRAND_STATION contains 388 station codes that never occur in the diary and
+      are not in DIM_STATION (prefixes 90xxxx and a few negative codes). Use LEFT JOIN
+      from the bridge to DIM_STATION. Facts always match DIM_STATION.
+  - id: unlabelled_codes
+    text: >-
+      WHERE_LISTENED_CODE, GENRE, WORKING_STATUS_CODE, MOSAIC_TYPE_CODE, ACORN_GROUP_CODE,
+      BBC_REGION_CODE and ITV_AREA_CODE have no labels in the source. Report codes as-is;
+      never invent labels.
+  - id: day_names_inferred
+    text: >-
+      DAY_NAME Monday..Sunday is inferred from diary day codes 1..7 (Saturday and Sunday
+      reach match published figures within 2%).
+
+# -------------------------------------------------------------------------------------
+# Glossary: business terms -> model
+# -------------------------------------------------------------------------------------
+glossary:
+  - term: reach
+    synonyms: [weekly reach, listeners, audience, unique listeners, weekly audience]
+    maps_to: metric weekly_reach_000s / brand_weekly_reach_000s
+  - term: hours
+    synonyms: [listening hours, total hours, time spent listening volume]
+    maps_to: metric total_hours_000s / brand_total_hours_000s
+  - term: TSL
+    synonyms: [average hours, time spent listening, hours per listener]
+    maps_to: metric avg_hours_per_listener / brand_avg_hours_per_listener
+  - term: brand
+    synonyms: [radio brand, station brand, network, sales group, SGP]
+    maps_to: DIM_BRAND.BRAND_NAME
+  - term: station
+    maps_to: DIM_STATION.STATION_NAME (one station appears once per platform; group by BASE_STATION_ID)
+  - term: owner
+    synonyms: [broadcaster, group, parent company]
+    maps_to: DIM_BRAND.OWNER
+  - term: platform
+    synonyms: [device, listening platform, AM/FM, FM, DAB, digital, online, streaming, smart speaker]
+    maps_to: FACT_*.PLATFORM
+  - term: ABC1 / C2DE
+    synonyms: [social segment, upmarket, downmarket]
+    maps_to: DIM_RESPONDENT.SOCIAL_SEGMENT
+  - term: region
+    synonyms: [area, ILR region, where they live]
+    maps_to: DIM_RESPONDENT.ILR_REGION (listener's home region); DIM_STATION.REGION_* (where a station broadcasts)
+  - term: weekend
+    maps_to: FACT_*.IS_WEEKEND or DAY_BAND IN ('Saturday','Sunday')
+
+# -------------------------------------------------------------------------------------
+# Tables
+# role: key | dimension | measure | technical
+# -------------------------------------------------------------------------------------
+tables:
+
+  - name: FACT_LISTENING
+    physical: HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_LISTENING
+    type: fact
+    grain: one diary listening claim (respondent x station code x day x time slot), adults 15+
+    row_count: 2327515
+    description: >-
+      Every AdWanted diary claim by an adult 15+. Use for all-radio, station, platform,
+      day and time questions that are not about a named brand.
+    primary_key: [LISTENING_ID]
+    columns:
+      - {name: LISTENING_ID, type: NUMBER, role: key, description: Surrogate key of the claim., distinct: 2327515}
+      - {name: RESPONDENT_ID, type: NUMBER, role: key, description: Respondent who made the claim. FK to DIM_RESPONDENT., distinct: 29676}
+      - {name: STATION_CODE, type: NUMBER, role: key, description: RAJAR station code listened to (platform prefix * 10000 + base station id). FK to DIM_STATION., distinct: 1947}
+      - {name: SLOT_CODE, type: NUMBER, role: key, description: Diary time slot 1-84. FK to DIM_TIME_SLOT., distinct: 84}
+      - {name: DAY_CODE, type: NUMBER, role: dimension, description: Diary day code 1-7 (1 = Monday)., values: [1, 2, 3, 4, 5, 6, 7]}
+      - {name: DAY_NAME, type: TEXT, role: dimension, description: Day of the week (inferred from DAY_CODE)., values: [Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday]}
+      - {name: DAY_BAND, type: TEXT, role: dimension, description: RAJAR day band., values: [Monday-Friday, Saturday, Sunday]}
+      - {name: IS_WEEKEND, type: BOOLEAN, role: dimension, description: True for Saturday and Sunday.}
+      - {name: PLATFORM_CODE, type: NUMBER, role: dimension, description: 'Raw diary platform code: 1 AM/FM, 2 DAB, 3 DTV, 4 and 5 Online, 7 and 8 Smart speaker.', values: [1, 2, 3, 4, 5, 7, 8]}
+      - {name: PLATFORM, type: TEXT, role: dimension, description: Listening platform., values: [AM/FM, DAB, DTV, Online, Smart speaker], synonyms: [device, FM, digital, streaming]}
+      - {name: WHERE_LISTENED_CODE, type: NUMBER, role: dimension, description: Place of listening code. Labels not in source., values: [1, 2, 3, 5], synonyms: [place of listening, location]}
+      - {name: STATIONS_CLAIMED_IN_SLOT, type: NUMBER, role: dimension, description: Stations the respondent claimed in the same slot; the slot's time is split between them., values: [1, 2, 3]}
+      - {name: QUARTER_HOURS, type: NUMBER, role: measure, description: 'Quarter-hours credited: (2 if half-hour slot else 1) / STATIONS_CLAIMED_IN_SLOT.', values: [1, 2, 0.5, 0.333333, 0.666667]}
+      - {name: WEIGHT_PERSONS, type: NUMBER, role: measure, description: Respondent weight in people. Do not sum across claims for reach., range: [1.7, 25000.3]}
+      - {name: WEIGHTED_HOURS, type: NUMBER, role: measure, description: Weighted weekly hours of the claim = WEIGHT_PERSONS * QUARTER_HOURS / 4. Additive., range: [0.425, 11538.4]}
+      - {name: REACH_BASE, type: NUMBER, role: technical, description: RESPONDENT_ID * 1e8. Used only inside the reach metric.}
+      - {name: REACH_KEY, type: NUMBER, role: technical, description: RESPONDENT_ID * 1e8 + raw weight. Used only inside the reach metric.}
+
+  - name: FACT_BRAND_LISTENING
+    physical: HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_BRAND_LISTENING
+    type: fact
+    grain: one diary claim x one brand the station counts towards
+    row_count: 5285404
+    description: >-
+      FACT_LISTENING rows repeated once per brand (SGP) containing the station. Use for any
+      brand, owner or cross-listening question. Must be filtered to or grouped by brand.
+    primary_key: [LISTENING_ID, BRAND_ID]
+    columns:
+      - {name: LISTENING_ID, type: NUMBER, role: key, description: Claim key; same value as FACT_LISTENING.LISTENING_ID., distinct: 2327515}
+      - {name: BRAND_ID, type: NUMBER, role: key, description: Brand the claim counts towards. FK to DIM_BRAND., distinct: 832}
+      - {name: RESPONDENT_ID, type: NUMBER, role: key, description: Respondent. FK to DIM_RESPONDENT., distinct: 29676}
+      - {name: STATION_CODE, type: NUMBER, role: key, description: Station code. FK to DIM_STATION., distinct: 1947}
+      - {name: SLOT_CODE, type: NUMBER, role: key, description: Time slot. FK to DIM_TIME_SLOT., distinct: 84}
+      - {name: DAY_CODE, type: NUMBER, role: dimension, description: Diary day code 1-7., values: [1, 2, 3, 4, 5, 6, 7]}
+      - {name: DAY_NAME, type: TEXT, role: dimension, description: Day of the week., values: [Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday]}
+      - {name: DAY_BAND, type: TEXT, role: dimension, description: RAJAR day band., values: [Monday-Friday, Saturday, Sunday]}
+      - {name: IS_WEEKEND, type: BOOLEAN, role: dimension, description: True for Saturday and Sunday.}
+      - {name: PLATFORM_CODE, type: NUMBER, role: dimension, description: Raw diary platform code., values: [1, 2, 3, 4, 5, 7, 8]}
+      - {name: PLATFORM, type: TEXT, role: dimension, description: Listening platform., values: [AM/FM, DAB, DTV, Online, Smart speaker]}
+      - {name: WHERE_LISTENED_CODE, type: NUMBER, role: dimension, description: Place of listening code. Labels not in source., values: [1, 2, 3, 5]}
+      - {name: STATIONS_CLAIMED_IN_SLOT, type: NUMBER, role: dimension, description: Stations claimed in the same slot., values: [1, 2, 3]}
+      - {name: QUARTER_HOURS, type: NUMBER, role: measure, description: Quarter-hours credited to the claim.}
+      - {name: WEIGHT_PERSONS, type: NUMBER, role: measure, description: Respondent weight in people. Do not sum for reach.}
+      - {name: WEIGHTED_HOURS, type: NUMBER, role: measure, description: Weighted weekly hours of the claim. Additive within one brand.}
+      - {name: REACH_BASE, type: NUMBER, role: technical, description: Used only inside the reach metric.}
+      - {name: REACH_KEY, type: NUMBER, role: technical, description: Used only inside the reach metric.}
+
+  - name: DIM_RESPONDENT
+    physical: HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_RESPONDENT
+    type: dimension
+    grain: one AdWanted respondent
+    row_count: 33839
+    description: >-
+      Respondents with survey weight and decoded demographics: 33,523 adults 15+ (29,676 of
+      whom listened) and 316 under-15s who never appear in the facts. Filter IS_ADULT_15_PLUS
+      for population figures.
+    primary_key: [RESPONDENT_ID]
+    columns:
+      - {name: RESPONDENT_ID, type: NUMBER, role: key, description: AdWanted respondent number (MTPersonNo)., range: [1, 33839]}
+      - {name: WEIGHT_RAW, type: NUMBER, role: technical, description: Source weight = people * 10., range: [17, 1462378]}
+      - {name: WEIGHT_PERSONS, type: NUMBER, role: measure, description: Weight in people. SUM over respondents = population represented., range: [1.7, 146237.8]}
+      - {name: AGE, type: NUMBER, role: dimension, description: Age in years. Use BETWEEN for custom ranges., range: [10, 99]}
+      - {name: IS_ADULT_15_PLUS, type: BOOLEAN, role: dimension, description: True if aged 15+ (the RAJAR universe).}
+      - {name: AGE_BAND, type: TEXT, role: dimension, description: Standard age band., values: [Under 15, 15-24, 25-34, 35-44, 45-54, 55-64, 65+]}
+      - {name: GENDER, type: TEXT, role: dimension, description: Gender., values: [Men, Women], synonyms: [sex]}
+      - {name: SOCIAL_GRADE, type: TEXT, role: dimension, description: NRS social grade., values: [A, B, C1, C2, D, E], synonyms: [class]}
+      - {name: SOCIAL_SEGMENT, type: TEXT, role: dimension, description: 'ABC1 = A, B, C1; C2DE = C2, D, E.', values: [ABC1, C2DE]}
+      - {name: ILR_REGION, type: TEXT, role: dimension, description: Home ILR region., values: [London, Midlands, North West, Yorkshire, North East, Central Scotland, North Scotland, South, East of England, South West, Ulster, Border, West, Wales, Channel Islands, Unassigned]}
+      - {name: BBC_REGION_CODE, type: NUMBER, role: dimension, description: BBC region code 1-14. Labels not in source.}
+      - {name: ITV_AREA_CODE, type: NUMBER, role: dimension, description: ITV area code. Labels not in source.}
+      - {name: HOUSEHOLD_SIZE, type: NUMBER, role: dimension, description: People in household (5 = 5 or more)., values: [1, 2, 3, 4, 5]}
+      - {name: CHILDREN_0_14_COUNT, type: NUMBER, role: dimension, description: Children aged 0-14 in household., range: [0, 9]}
+      - {name: HAS_CHILDREN_0_14, type: BOOLEAN, role: dimension, description: Household has children aged 0-14., synonyms: [parents, has kids]}
+      - {name: WORKING_STATUS_CODE, type: NUMBER, role: dimension, description: Working status code 0-6. Labels not in source.}
+      - {name: MOSAIC_TYPE_CODE, type: NUMBER, role: dimension, description: Mosaic type code 0-66. Labels not in source.}
+      - {name: ACORN_GROUP_CODE, type: NUMBER, role: dimension, description: Acorn 2023 group code 0-7. Labels not in source.}
+      - {name: USES_GLOBAL_PLAYER, type: BOOLEAN, role: dimension, description: Uses the Global Player website or app.}
+      - {name: USES_BBC_SOUNDS, type: BOOLEAN, role: dimension, description: Uses BBC Sounds.}
+      - {name: USES_RADIOPLAYER, type: BOOLEAN, role: dimension, description: Uses Radioplayer.}
+      - {name: USES_CAPITAL_APP, type: BOOLEAN, role: dimension, description: Uses the Capital website or app.}
+      - {name: USES_HEART_APP, type: BOOLEAN, role: dimension, description: Uses the Heart website or app.}
+      - {name: USES_KISS_APP, type: BOOLEAN, role: dimension, description: Uses the Kiss website or app.}
+      - {name: USES_MAGIC_APP, type: BOOLEAN, role: dimension, description: Uses the Magic website or app.}
+      - {name: USES_ABSOLUTE_RADIO_APP, type: BOOLEAN, role: dimension, description: Uses the Absolute Radio website or app.}
+      - {name: USES_TALKSPORT_APP, type: BOOLEAN, role: dimension, description: Uses the talkSPORT website or app.}
+
+  - name: DIM_STATION
+    physical: HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_STATION
+    type: dimension
+    grain: one RAJAR station code (station x platform)
+    row_count: 2395
+    description: >-
+      Station codes with platform, name, genre, BBC/commercial group flags and broadcast
+      regions. One station appears once per platform (e.g. 100002 BBC Radio 2 AM/FM,
+      200002 DAB, 400002 Online); use BASE_STATION_ID to combine platforms.
+    primary_key: [STATION_CODE]
+    columns:
+      - {name: STATION_CODE, type: NUMBER, role: key, description: Platform prefix * 10000 + base station id., range: [100001, 432752]}
+      - {name: BASE_STATION_ID, type: NUMBER, role: dimension, description: Station id without platform prefix; groups all platforms of one station., distinct: 534}
+      - {name: PLATFORM, type: TEXT, role: dimension, description: Platform implied by the code prefix (10 AM/FM, 20 DAB, 30 DTV, 40/41 Online, 42/43 Smart speaker)., values: [AM/FM, DAB, DTV, Online, Smart speaker]}
+      - {name: STATION_NAME, type: TEXT, role: dimension, description: Station name, title-cased; same across platforms. Match with ILIKE., distinct: 546, examples: [Bbc Radio 2, Bbc Radio 4, Capital London, Heart Kent, Hits Radio (London) (Was Kiss 100 Fm)]}
+      - {name: STATION_PLATFORM_NAME, type: TEXT, role: dimension, description: RAJAR upper-case name including platform, e.g. 'BBC RADIO 2 AM/FM ONLY'. Null for 98 new codes., nulls: 98}
+      - {name: IS_IN_RAJAR_STATION_LIST, type: BOOLEAN, role: dimension, description: False for 98 new codes not yet in RAJAR's station list (name taken from the smallest brand containing them).}
+      - {name: GENRE, type: TEXT, role: dimension, description: RAJAR genre code. Labels not in source., values: [P, G, O], nulls: 560}
+      - {name: IS_BBC, type: BOOLEAN, role: dimension, description: Part of All BBC.}
+      - {name: IS_COMMERCIAL, type: BOOLEAN, role: dimension, description: Part of All Commercial radio.}
+      - {name: IS_NATIONAL_COMMERCIAL, type: BOOLEAN, role: dimension, description: Part of All National Commercial.}
+      - {name: IS_LOCAL_COMMERCIAL, type: BOOLEAN, role: dimension, description: Part of All Local Commercial.}
+      - {name: IS_BBC_LOCAL_REGIONAL, type: BOOLEAN, role: dimension, description: Part of BBC Local/Regional.}
+      - {name: REGION_LONDON, type: BOOLEAN, role: dimension, description: Broadcasts in London.}
+      - {name: REGION_MIDLANDS, type: BOOLEAN, role: dimension, description: Broadcasts in the Midlands.}
+      - {name: REGION_NORTH_WEST, type: BOOLEAN, role: dimension, description: Broadcasts in the North West.}
+      - {name: REGION_YORKSHIRE, type: BOOLEAN, role: dimension, description: Broadcasts in Yorkshire.}
+      - {name: REGION_NORTH_EAST, type: BOOLEAN, role: dimension, description: Broadcasts in the North East.}
+      - {name: REGION_CENTRAL_SCOTLAND, type: BOOLEAN, role: dimension, description: Broadcasts in Central Scotland.}
+      - {name: REGION_NORTH_SCOTLAND, type: BOOLEAN, role: dimension, description: Broadcasts in North Scotland.}
+      - {name: REGION_SOUTH, type: BOOLEAN, role: dimension, description: Broadcasts in the South.}
+      - {name: REGION_EAST_OF_ENGLAND, type: BOOLEAN, role: dimension, description: Broadcasts in the East of England.}
+      - {name: REGION_SOUTH_WEST, type: BOOLEAN, role: dimension, description: Broadcasts in the South West.}
+      - {name: REGION_ULSTER, type: BOOLEAN, role: dimension, description: Broadcasts in Ulster.}
+      - {name: REGION_BORDER, type: BOOLEAN, role: dimension, description: Broadcasts in the Border region.}
+      - {name: REGION_WEST, type: BOOLEAN, role: dimension, description: Broadcasts in the West.}
+      - {name: REGION_WALES, type: BOOLEAN, role: dimension, description: Broadcasts in Wales.}
+      - {name: REGION_CHANNEL_ISLANDS, type: BOOLEAN, role: dimension, description: Broadcasts in the Channel Islands.}
+
+  - name: DIM_BRAND
+    physical: HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND
+    type: dimension
+    grain: one AdWanted brand / sales group (SGP)
+    row_count: 1192
+    description: >-
+      Brands and trading packages, with owner and the matching published RAJAR report and its
+      2026 Q2 headline figures. 832 brands have listening in the facts; 812 have a RAJAR report.
+    primary_key: [BRAND_ID]
+    columns:
+      - {name: BRAND_ID, type: NUMBER, role: key, description: AdWanted SGP_ID. Not a RAJAR report number., range: [10002, 19296]}
+      - {name: BRAND_NAME, type: TEXT, role: dimension, description: Brand or package name as traded. Unique., distinct: 1192, examples: [BBC Radio 2, Heart London, Capital London, LBC (UK), Greatest Hits Radio, Capital XTRA (UK), Smooth Radio London, Heart 70s Sponsorship Trading], synonyms: [brand, network, sales group]}
+      - {name: STATION_CODE_COUNT, type: NUMBER, role: dimension, description: Number of station codes in the brand., range: [1, 318]}
+      - {name: IS_AIRTIME_PACKAGE, type: BOOLEAN, role: dimension, description: Airtime trading package.}
+      - {name: IS_SPONSORSHIP_PACKAGE, type: BOOLEAN, role: dimension, description: Sponsorship trading package.}
+      - {name: IS_TRADED, type: BOOLEAN, role: dimension, description: Traded by AdWanted.}
+      - {name: IS_ON_RAJAR, type: BOOLEAN, role: dimension, description: Reported on RAJAR.}
+      - {name: RAJAR_REPORT_NUMBER, type: NUMBER, role: key, description: Matching published RAJAR report number. Joins to RAJAR WEEKLY_REACH*.REPORT_NUMBER., nulls: 380}
+      - {name: RAJAR_REPORT_NAME, type: TEXT, role: dimension, description: Matching RAJAR report name., nulls: 380}
+      - {name: RAJAR_MATCH_TYPE, type: TEXT, role: dimension, description: How the report was matched., values: [Same station set, Same name, No RAJAR report]}
+      - {name: OWNER, type: TEXT, role: dimension, description: Owning organisation (RAJAR PARENT_ORG). UNKNOWN when no report matched., values: [GLOBAL, GLOBAL - BRANDS, GLOBAL - COMMUNICORP, BAUER, BAUER - PARTNER, BBC, NEWS BROADCASTING, SUNRISE, OTHER, UNKNOWN], synonyms: [broadcaster, group]}
+      - {name: IS_NATIONAL, type: BOOLEAN, role: dimension, description: Matching report is national. Null when unknown., nulls: 813}
+      - {name: IS_LOCAL, type: BOOLEAN, role: dimension, description: Matching report is local. Null when unknown., nulls: 801}
+      - {name: IS_COMMERCIAL, type: BOOLEAN, role: dimension, description: Matching report is commercial. Null when unknown., nulls: 802}
+      - {name: REPORT_IS_STATION, type: BOOLEAN, role: dimension, description: Matching report is a single station., nulls: 801}
+      - {name: REPORT_IS_BRAND, type: BOOLEAN, role: dimension, description: Matching report is a brand total (e.g. Heart Brand (UK))., nulls: 801}
+      - {name: REPORT_IS_NETWORK, type: BOOLEAN, role: dimension, description: Matching report is a network., nulls: 801}
+      - {name: REPORT_IS_REGION, type: BOOLEAN, role: dimension, description: Matching report is a regional grouping., nulls: 807}
+      - {name: PUBLISHED_SURVEY_PERIOD, type: TEXT, role: dimension, description: 'Fieldwork period of the published figure: Q 3 months, H 6 months, Y 12 months.', values: [Q, H, Y], nulls: 849}
+      - {name: PUBLISHED_WEEKLY_REACH_000S, type: NUMBER, role: measure, description: Published RAJAR 2026 Q2 weekly reach (000s). Not additive., nulls: 849}
+      - {name: PUBLISHED_TOTAL_HOURS_000S, type: NUMBER, role: measure, description: Published RAJAR 2026 Q2 total weekly hours (000s)., nulls: 849}
+      - {name: PUBLISHED_MARKET_SHARE_PCT, type: NUMBER, role: measure, description: Published market share in the report's own area (%). Not comparable across areas., nulls: 849}
+
+  - name: BRIDGE_BRAND_STATION
+    physical: HACKATHON_TEAM_GINGER_DB.ANALYTICS.BRIDGE_BRAND_STATION
+    type: bridge
+    grain: one brand x station code membership
+    row_count: 6777
+    description: >-
+      Which station codes make up each brand (many-to-many). FACT_BRAND_LISTENING is already
+      built from it, so use it only for questions about brand composition ("which stations
+      are in Heart London?"). Contains 388 codes not in DIM_STATION; LEFT JOIN to stations.
+    primary_key: [BRAND_ID, STATION_CODE]
+    columns:
+      - {name: BRAND_ID, type: NUMBER, role: key, description: FK to DIM_BRAND., distinct: 1192}
+      - {name: STATION_CODE, type: NUMBER, role: key, description: Station code in the brand. 388 codes have no DIM_STATION row., distinct: 2730}
+
+  # Supporting table: not in the requested list, but needed for daypart / time questions.
+  - name: DIM_TIME_SLOT
+    physical: HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_TIME_SLOT
+    type: dimension
+    grain: one diary time slot
+    row_count: 84
+    description: Diary slots (quarter-hours 06:00-24:00, half-hours overnight) with daypart labels.
+    primary_key: [SLOT_CODE]
+    columns:
+      - {name: SLOT_CODE, type: NUMBER, role: key, description: Slot 1-84; slot 1 starts 04:00.}
+      - {name: SLOT_START, type: TIME, role: dimension, description: Slot start time.}
+      - {name: SLOT_END, type: TIME, role: dimension, description: Slot end time.}
+      - {name: SLOT_LABEL, type: TEXT, role: dimension, description: HH:MI-HH:MI, e.g. 07:00-07:15.}
+      - {name: HOUR_OF_DAY, type: NUMBER, role: dimension, description: Hour of slot start 0-23.}
+      - {name: IS_HALF_HOUR, type: BOOLEAN, role: dimension, description: True for the 12 overnight half-hour slots.}
+      - {name: SLOT_QUARTER_HOURS, type: NUMBER, role: dimension, description: Slot length in quarter-hours (1 or 2).}
+      - {name: DAYPART, type: TEXT, role: dimension, description: 'Breakfast 06-10, Daytime 10-16, Drive 16-19, Evening 19-24, Overnight 00-06.', values: [Breakfast, Daytime, Drive, Evening, Overnight]}
+      - {name: DAYPART_ORDER, type: NUMBER, role: dimension, description: Sort order 1 Breakfast .. 5 Overnight.}
+      - {name: RAJAR_TIME_BAND, type: TEXT, role: dimension, description: Published RAJAR 3-hour band (matches DAYPART_REACH_* TIME_BAND)., values: ['06.00-09.00', '09.00-12.00', '12.00-15.00', '15.00-18.00', '18.00-21.00', '21.00-24.00', '24.00-06.00']}
+
+# -------------------------------------------------------------------------------------
+# Relationships (all many_to_one unless stated)
+# -------------------------------------------------------------------------------------
+relationships:
+  - {from: FACT_LISTENING.RESPONDENT_ID,       to: DIM_RESPONDENT.RESPONDENT_ID, join: inner, coverage: 100%}
+  - {from: FACT_LISTENING.STATION_CODE,        to: DIM_STATION.STATION_CODE,     join: inner, coverage: 100%}
+  - {from: FACT_LISTENING.SLOT_CODE,           to: DIM_TIME_SLOT.SLOT_CODE,      join: inner, coverage: 100%}
+  - {from: FACT_BRAND_LISTENING.BRAND_ID,      to: DIM_BRAND.BRAND_ID,           join: inner, coverage: 100%}
+  - {from: FACT_BRAND_LISTENING.RESPONDENT_ID, to: DIM_RESPONDENT.RESPONDENT_ID, join: inner, coverage: 100%}
+  - {from: FACT_BRAND_LISTENING.STATION_CODE,  to: DIM_STATION.STATION_CODE,     join: inner, coverage: 100%}
+  - {from: FACT_BRAND_LISTENING.SLOT_CODE,     to: DIM_TIME_SLOT.SLOT_CODE,      join: inner, coverage: 100%}
+  - {from: FACT_BRAND_LISTENING.LISTENING_ID,  to: FACT_LISTENING.LISTENING_ID,  join: inner, cardinality: many_to_one, note: Same claim; brand fact adds BRAND_ID.}
+  - {from: BRIDGE_BRAND_STATION.BRAND_ID,      to: DIM_BRAND.BRAND_ID,           join: inner, coverage: 100%}
+  - {from: BRIDGE_BRAND_STATION.STATION_CODE,  to: DIM_STATION.STATION_CODE,     join: left,  coverage: 86% (388 of 2,730 codes unmatched)}
+  - {from: DIM_BRAND.RAJAR_REPORT_NUMBER,      to: SRC_RAJAR_SHARE.RAJAR.WEEKLY_REACH.REPORT_NUMBER, join: left, note: 'External: add RELEASE_NUMBER = 202602 for the same quarter; other releases give trends.'}
+
+# -------------------------------------------------------------------------------------
+# Metrics (SQL fragments; alias f = the fact table)
+# -------------------------------------------------------------------------------------
+metrics:
+  - name: weekly_reach_000s
+    table: FACT_LISTENING
+    sql: (SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10000
+    unit: thousands of people
+    additive: false
+    description: Weighted distinct adults 15+ who listened at least one quarter-hour in the week, within the filters.
+    synonyms: [reach, listeners, audience]
+  - name: total_hours_000s
+    table: FACT_LISTENING
+    sql: SUM(f.WEIGHTED_HOURS) / 1000
+    unit: thousands of weekly hours
+    additive: true
+    description: Total weighted weekly listening hours.
+  - name: avg_hours_per_listener
+    table: FACT_LISTENING
+    sql: SUM(f.WEIGHTED_HOURS) / NULLIF((SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10, 0)
+    unit: hours per listener per week
+    additive: false
+    description: Total hours / weekly reach.
+    synonyms: [TSL, time spent listening]
+  - name: unweighted_sample
+    table: FACT_LISTENING
+    sql: COUNT(DISTINCT f.RESPONDENT_ID)
+    unit: respondents
+    additive: false
+    description: Distinct respondents behind a figure. Below 100 = low base.
+  - name: brand_weekly_reach_000s
+    table: FACT_BRAND_LISTENING
+    sql: (SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10000
+    unit: thousands of people
+    additive: false
+    description: Weekly reach of a brand. Only valid when filtered to or grouped by brand.
+  - name: brand_total_hours_000s
+    table: FACT_BRAND_LISTENING
+    sql: SUM(f.WEIGHTED_HOURS) / 1000
+    unit: thousands of weekly hours
+    additive: true (within one brand)
+    description: Total weekly hours to a brand.
+  - name: brand_avg_hours_per_listener
+    table: FACT_BRAND_LISTENING
+    sql: SUM(f.WEIGHTED_HOURS) / NULLIF((SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10, 0)
+    unit: hours per listener per week
+    additive: false
+    description: Average weekly hours per brand listener.
+  - name: brand_unweighted_sample
+    table: FACT_BRAND_LISTENING
+    sql: COUNT(DISTINCT f.RESPONDENT_ID)
+    unit: respondents
+    additive: false
+    description: Distinct respondents behind a brand figure.
+  - name: population_000s
+    table: DIM_RESPONDENT
+    sql: SUM(r.WEIGHT_PERSONS) / 1000
+    unit: thousands of people
+    additive: true
+    description: Population represented; filter r.IS_ADULT_15_PLUS for the RAJAR universe (59,047k).
+
+# -------------------------------------------------------------------------------------
+# Verified queries (plain Snowflake SQL on the physical tables)
+# -------------------------------------------------------------------------------------
+verified_queries:
+  - question: What is the weekly reach of BBC Radio 2?
+    expected: {weekly_reach_000s: 12367, total_hours_000s: 138039, unweighted_sample: 7895}
+    sql: |
+      SELECT (SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10000 AS weekly_reach_000s,
+             SUM(f.WEIGHTED_HOURS) / 1000 AS total_hours_000s,
+             COUNT(DISTINCT f.RESPONDENT_ID) AS unweighted_sample
+      FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_BRAND_LISTENING f
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND b ON b.BRAND_ID = f.BRAND_ID
+      WHERE b.BRAND_NAME = 'BBC Radio 2'
+
+  - question: What is total radio's weekly reach and hours?
+    expected: {weekly_reach_000s: 51119, total_hours_000s: 1040047}
+    sql: |
+      SELECT (SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10000 AS weekly_reach_000s,
+             SUM(f.WEIGHTED_HOURS) / 1000 AS total_hours_000s,
+             COUNT(DISTINCT f.RESPONDENT_ID) AS unweighted_sample
+      FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_LISTENING f
+
+  - question: What is BBC Radio 2's weekly reach among women aged 25 to 34?
+    expected: {weekly_reach_000s: 602, unweighted_sample: 466}
+    sql: |
+      SELECT (SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10000 AS weekly_reach_000s,
+             COUNT(DISTINCT f.RESPONDENT_ID) AS unweighted_sample
+      FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_BRAND_LISTENING f
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND b      ON b.BRAND_ID = f.BRAND_ID
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_RESPONDENT r ON r.RESPONDENT_ID = f.RESPONDENT_ID
+      WHERE b.BRAND_NAME = 'BBC Radio 2' AND r.GENDER = 'Women' AND r.AGE BETWEEN 25 AND 34
+
+  - question: Which 5 Global brands have the highest weekly reach among 15-34 year olds?
+    expected: {top_brand: Capital XTRA (UK), weekly_reach_000s: 885.9, unweighted_sample: 405}
+    sql: |
+      SELECT b.BRAND_NAME,
+             (SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10000 AS weekly_reach_000s,
+             COUNT(DISTINCT f.RESPONDENT_ID) AS unweighted_sample
+      FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_BRAND_LISTENING f
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND b      ON b.BRAND_ID = f.BRAND_ID
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_RESPONDENT r ON r.RESPONDENT_ID = f.RESPONDENT_ID
+      WHERE b.OWNER LIKE 'GLOBAL%' AND r.AGE BETWEEN 15 AND 34
+      GROUP BY b.BRAND_NAME
+      ORDER BY weekly_reach_000s DESC
+      LIMIT 5
+
+  - question: How does Heart London's reach and hours split by platform?
+    sql: |
+      SELECT f.PLATFORM,
+             (SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10000 AS weekly_reach_000s,
+             SUM(f.WEIGHTED_HOURS) / 1000 AS total_hours_000s,
+             COUNT(DISTINCT f.RESPONDENT_ID) AS unweighted_sample
+      FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_BRAND_LISTENING f
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND b ON b.BRAND_ID = f.BRAND_ID
+      WHERE b.BRAND_NAME = 'Heart London'
+      GROUP BY f.PLATFORM
+      ORDER BY total_hours_000s DESC
+
+  - question: How are Capital London's hours spread across dayparts?
+    sql: |
+      SELECT t.DAYPART,
+             SUM(f.WEIGHTED_HOURS) / 1000 AS total_hours_000s,
+             (SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10000 AS weekly_reach_000s,
+             COUNT(DISTINCT f.RESPONDENT_ID) AS unweighted_sample
+      FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_BRAND_LISTENING f
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND b     ON b.BRAND_ID = f.BRAND_ID
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_TIME_SLOT t ON t.SLOT_CODE = f.SLOT_CODE
+      WHERE b.BRAND_NAME = 'Capital London'
+      GROUP BY t.DAYPART, t.DAYPART_ORDER
+      ORDER BY t.DAYPART_ORDER
+
+  - question: What share of Heart London listeners also listen to Capital London?
+    expected: {heart_reach_000s: 1851, also_capital_000s: 441, pct_also_capital: 23.8}
+    sql: |
+      WITH heart AS (
+          SELECT DISTINCT f.RESPONDENT_ID
+          FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_BRAND_LISTENING f
+          JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND b ON b.BRAND_ID = f.BRAND_ID
+          WHERE b.BRAND_NAME = 'Heart London'
+      ), capital AS (
+          SELECT DISTINCT f.RESPONDENT_ID
+          FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_BRAND_LISTENING f
+          JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND b ON b.BRAND_ID = f.BRAND_ID
+          WHERE b.BRAND_NAME = 'Capital London'
+      )
+      SELECT SUM(r.WEIGHT_PERSONS) / 1000 AS heart_reach_000s,
+             SUM(IFF(c.RESPONDENT_ID IS NOT NULL, r.WEIGHT_PERSONS, 0)) / 1000 AS also_capital_000s,
+             100 * SUM(IFF(c.RESPONDENT_ID IS NOT NULL, r.WEIGHT_PERSONS, 0)) / SUM(r.WEIGHT_PERSONS) AS pct_also_capital,
+             COUNT(*) AS unweighted_sample
+      FROM heart h
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_RESPONDENT r ON r.RESPONDENT_ID = h.RESPONDENT_ID
+      LEFT JOIN capital c ON c.RESPONDENT_ID = h.RESPONDENT_ID
+
+  - question: Which stations make up the Heart London brand?
+    sql: |
+      SELECT bs.STATION_CODE, s.STATION_NAME, s.PLATFORM
+      FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.BRIDGE_BRAND_STATION bs
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND b        ON b.BRAND_ID = bs.BRAND_ID
+      LEFT JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_STATION s ON s.STATION_CODE = bs.STATION_CODE
+      WHERE b.BRAND_NAME = 'Heart London'
+      ORDER BY s.PLATFORM, bs.STATION_CODE
+
+  - question: Which Global brands' AdWanted reach can be compared like-for-like with the published RAJAR figure?
+    sql: |
+      SELECT b.BRAND_NAME, b.PUBLISHED_WEEKLY_REACH_000S,
+             (SUM(DISTINCT f.REACH_KEY) - SUM(DISTINCT f.REACH_BASE)) / 10000 AS weekly_reach_000s
+      FROM HACKATHON_TEAM_GINGER_DB.ANALYTICS.FACT_BRAND_LISTENING f
+      JOIN HACKATHON_TEAM_GINGER_DB.ANALYTICS.DIM_BRAND b ON b.BRAND_ID = f.BRAND_ID
+      WHERE b.OWNER LIKE 'GLOBAL%' AND b.PUBLISHED_SURVEY_PERIOD = 'Q'
+      GROUP BY b.BRAND_NAME, b.PUBLISHED_WEEKLY_REACH_000S
+      ORDER BY weekly_reach_000s DESC

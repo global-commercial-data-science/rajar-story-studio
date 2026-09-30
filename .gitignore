@@ -1,0 +1,75 @@
+# =====================================================================
+# Secrets and credentials: never commit these
+# =====================================================================
+
+# Environment files (OpenAI key, Snowflake account/user/key, passphrases)
+*.env
+.env
+
+
+# Snowflake connection config and key-pair files (normally in ~/.snowflake, but never in the repo)
+connections.toml
+config.toml
+.snowflake/
+*.p8
+*.p12
+*.pfx
+rsa_key*
+*_key.pub
+*.pub
+
+# TLS certificates and private keys (app/serve_lan.sh --https writes to app/.certs)
+app/.certs/
+*.pem
+*.key
+*.crt
+*.csr
+
+# Programmatic access tokens, passcodes and other secrets saved to disk
+*token*.txt
+*secret*
+passcode*.txt
+.netrc
+.docker/config.json
+
+# =====================================================================
+# Data and generated output (RAJAR figures, agent results, exports)
+# =====================================================================
+
+# Local agent cache: angles, drafts and audience queries built from licensed RAJAR data
+app/.cache/
+
+# Exported drafts and data extracts
+*.docx
+*.xlsx
+*.csv
+*.parquet
+
+# =====================================================================
+# Build output, dependencies and tooling
+# =====================================================================
+
+node_modules/
+app/frontend/dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Separate repository copied in for reference (has its own git history and secrets handling)
+reference_project/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.log
+docs/superpowers/
+

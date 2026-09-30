@@ -1,0 +1,11 @@
+# Runtime dependencies for the container (pinned to the versions tested locally)
+fastapi==0.136.1
+uvicorn==0.40.0
+pydantic==2.12.5
+pydantic-ai-slim[openai]==1.53.0
+openai==2.16.0
+snowflake-connector-python==4.2.0
+python-docx==1.2.0
+python-dotenv==1.2.1
+PyYAML==6.0.3
+httpx==0.28.1

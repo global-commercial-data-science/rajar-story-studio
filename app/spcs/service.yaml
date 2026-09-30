@@ -1,0 +1,31 @@
+# Snowpark Container Services spec for RAJAR Pulse. deploy.py fills in {{IMAGE}}.
+# SNOWFLAKE_HOST and SNOWFLAKE_ACCOUNT are injected by Snowflake automatically.
+spec:
+  containers:
+    - name: pulse
+      image: "{{IMAGE}}"
+      env:
+        SNOWFLAKE_WAREHOUSE: HACKATHON_TEAM_GINGER_BASIC_WH
+        SNOWFLAKE_DATABASE: HACKATHON_TEAM_GINGER_DB
+        SNOWFLAKE_SCHEMA: ANALYTICS
+        OPENAI_MODEL: gpt-6-sol
+      secrets:
+        # The OpenAI key lives in a Snowflake secret and arrives as the OPENAI_API_KEY environment variable
+        - snowflakeSecret:
+            objectName: HACKATHON_TEAM_GINGER_DB.ANALYTICS.OPENAI_API_KEY
+          secretKeyRef: secret_string
+          envVarName: OPENAI_API_KEY
+      readinessProbe:
+        port: 8000
+        path: /api/health
+      resources:
+        requests:
+          memory: 1G
+          cpu: 0.5
+        limits:
+          memory: 2G
+          cpu: 1
+  endpoints:
+    - name: app
+      port: 8000
+      public: true

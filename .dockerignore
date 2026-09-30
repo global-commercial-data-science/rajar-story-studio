@@ -1,0 +1,16 @@
+# Never ship secrets, keys, caches or local tooling in the image
+.env
+.env.*
+**/.cache
+**/.certs
+**/node_modules
+app/frontend/dist
+reference_project
+docs
+scripts
+sql
+**/__pycache__
+**/*.pyc
+**/tests
+*.docx
+.DS_Store
