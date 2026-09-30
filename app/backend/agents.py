@@ -60,7 +60,7 @@ def _cortex_model():
 
 # Bump when a prompt changes so cached results made with the old prompt are not reused
 ANGLE_PROMPT_VERSION = 4
-WRITER_PROMPT_VERSION = 5
+WRITER_PROMPT_VERSION = 6
 
 FORMATS = {
     "press_release": (
@@ -339,7 +339,7 @@ def writer_agent_prompt(ctx: RunContext[State]) -> str:
     return f"""
     # Role and Objective
     You are Global's senior comms writer. Write the {s.draft_format.replace('_', ' ')} for the {s.facts.release_label}
-    RAJAR results using only the selected angles.
+    RAJAR results from the selected angles and the editor notes in the request.
 
     # Format
     {spec}
@@ -360,18 +360,27 @@ def writer_agent_prompt(ctx: RunContext[State]) -> str:
     - Facts marked [CONFIRM] may be used but only if an angle needs them. Never write "[CONFIRM]" or any other
       bracketed marker in the copy; the app flags those figures to the editor itself.
 
-    # Editor notes
-    Follow these. They may include narrative pasted from Ask Pulse: weave its points into the copy and reuse any
-    {{{{tokens}}}} it contains. Figures written out as plain numbers in the notes are unverified custom cuts, so never
-    copy those numbers into the copy; describe them in words (e.g. "LBC's audience skews older") or leave them out.
-    {s.editor_notes or 'None'}
+    # Editor notes (they come with the request; they take priority)
+    - Every point in the editor notes must show up in the copy, even if it goes beyond the selected angles. Notes
+      often hold narrative pasted from Ask Pulse: work each point in, and reuse every {{{{token}}}} the notes contain.
+    - Figures written out as plain numbers in the notes are unverified custom cuts. Never copy those numbers; keep the
+      point and say it in words (e.g. "LBC's audience skews older", "most of its listening is on DAB").
 
     # Selected angles
 {angles}
 
     # Fact tokens
-{_facts_digest(s, families={a.get("family") for a in s.angles if a.get("family")} | {s.facts.by_key()[k].family for a in s.angles for k in a["fact_keys"] if k in s.facts.by_key() and s.facts.by_key()[k].family}, keys={k for a in s.angles for k in a["fact_keys"]})}
+{_facts_digest(s, families={a.get("family") for a in s.angles if a.get("family")} | {s.facts.by_key()[k].family for a in s.angles for k in a["fact_keys"] if k in s.facts.by_key() and s.facts.by_key()[k].family}, keys={k for a in s.angles for k in a["fact_keys"]} | set(token_keys(s.editor_notes)))}
     """
+
+
+def writer_request(state: State) -> str:
+    """The writer's user message: the task, plus the editor notes as instructions it must apply."""
+    task = f"Write the {state.draft_format.replace('_', ' ')}."
+    if not state.editor_notes.strip():
+        return task
+    return (f"{task}\n\nApply these editor notes. Every point must show up in the copy "
+            f"(figures as {{{{tokens}}}} or in words, never as typed numbers):\n\n{state.editor_notes.strip()}")
 
 
 @writer_agent.output_validator
@@ -500,7 +509,7 @@ class WriterNode(BaseNode[State, None, DraftOutput]):
     model: object = None
 
     async def run(self, ctx: GraphRunContext[State]) -> End[DraftOutput]:
-        result = await writer_agent.run(f"Write the {ctx.state.draft_format}.", deps=ctx.state, model=self.model or default_model())
+        result = await writer_agent.run(writer_request(ctx.state), deps=ctx.state, model=self.model or default_model())
         ctx.state.model_used = result.response.model_name or config.LLM_MODEL
         return End(result.output)
 

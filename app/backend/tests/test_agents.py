@@ -90,6 +90,24 @@ def test_writer_rejects_confirm_markers():
     assert calls["n"] == 2 and "[CONFIRM]" not in out.markdown
 
 
+def test_writer_gets_editor_notes_in_its_request_and_their_tokens_in_the_fact_list():
+    seen = {}
+
+    def fake_llm(messages, info):
+        request = messages[0]
+        seen["system"] = "\n".join(p.content for p in request.parts if p.part_kind == "system-prompt")
+        seen["user"] = "\n".join(p.content for p in request.parts if p.part_kind == "user-prompt")
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name,
+                                                 {"title": "LBC", "subtitle_lines": [], "markdown": "LBC reaches {{lbc_reach}}."})])
+
+    notes = "Mention that Heart reaches {{heart_reach}} and its audience skews female."
+    state = State(facts=small_factset(), angles=[{"headline": "LBC", "fact_keys": ["lbc_reach"], "why": ""}],
+                  editor_notes=notes)
+    asyncio.run(run_draft(state, model=FunctionModel(fake_llm)))
+    assert notes in seen["user"]
+    assert "heart_reach = 12.8 million" in seen["system"]
+
+
 def test_angle_headline_prefixes_are_stripped():
     model = TestModel(call_tools=[], custom_output_args={
         "angles": [{"id": "a", "headline": "Selected: LBC record", "brand": "lbc", "fact_keys": ["lbc_reach"],
